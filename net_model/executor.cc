@@ -22,12 +22,11 @@ int main(int argc, char ** argv)
 	usListenPort = (unsigned short)GetPrivateProfileIntA("config", "listen_port", 0, szCfgFile);
 	usPubPort = (unsigned short)GetPrivateProfileIntA("config", "publish_port", 0, szCfgFile);
 	GetPrivateProfileStringA("config", "log_path", "", szLogPath, sizeof(szLogPath), szCfgFile);
-
 	char szZkHome[256] = { 0 };
 	GetPrivateProfileStringA("config", "zookeeper_home", "", szZkHome, sizeof(szZkHome), szCfgFile);
-
 	unsigned int uiUseZk = GetPrivateProfileInt("config", "use_zookeeper", 0, szCfgFile);
-
+	char szLocalIp[32] = { 0 };
+	GetPrivateProfileString("config", "local_ip", "", szLocalIp, sizeof(szLocalIp), szCfgFile);
 	uwb_network::Listener listener(szLogPath);
 	if (listener.Start(usListenPort, usPubPort) == 0) {
 		printf("start\n");

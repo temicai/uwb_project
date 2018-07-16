@@ -16,6 +16,31 @@ void uwb_network::handle_netdata_queue_thread(void * param_)
 	}
 }
 
+void uwb_network::update_zk_state_thread(void * param_)
+{
+	auto pInst = (uwb_network::Listener *)param_;
+	if (pInst) {
+		while (1) {
+			int nCount = 0;
+			while (nCount < 60) {
+				std::this_thread::sleep_for(std::chrono::seconds(2));
+				if (!pInst->m_bRunning) {
+					break;
+				}
+			}
+			if (!pInst->m_bRunning) {
+				break;
+			}
+			if (pInst->m_bConnectZk && pInst->m_zk) {
+				timeb t;
+				ftime(&t);
+				pInst->m_listenerData.uUpdateTime = t.time * 1000 + t.millitm;
+				pInst->zk_updateNode();
+			}
+		}
+	}
+}
+
 void uwb_network::zk_server_watcher(zhandle_t * zk_, int nType_, int nState_, const char * path_,
 	void * watcherCtx_)
 {
@@ -52,6 +77,47 @@ void uwb_network::zk_create_node_completion(int rc_, const char * path_, const v
 	}
 }
 
+void uwb_network::zk_create_instance_completion(int rc_, const char *value_, const void *data_)
+{
+	auto pInst = (uwb_network::Listener *)data_;
+	if (pInst) {
+		switch (rc_) {
+			case ZCONNECTIONLOSS:
+			case ZOPERATIONTIMEOUT:
+				if (pInst->m_bRunning) {
+					pInst->zk_addNode();
+				}
+				break;
+			case ZNODEEXISTS: {
+				if (pInst->m_bRunning) {
+					pInst->zk_updateNode();
+				}
+				break;
+			}
+		}
+	}
+}
+
+void uwb_network::zk_set_node_stat_completion(int rc_, const struct Stat * stat_, const void *data_)
+{
+	auto pInst = (uwb_network::Listener *)data_;
+	if (pInst) {
+		switch (rc_) {
+			case ZCONNECTIONLOSS:
+			case ZOPERATIONTIMEOUT:
+				if (pInst->m_bRunning) {
+					pInst->zk_updateNode();
+				}
+				break;
+			case ZNONODE: 
+				if (pInst->m_bRunning) {
+					pInst->zk_addNode();
+				}
+				break;
+		}
+	}
+}
+
 uwb_network::Listener::Listener(const char * logPath_, unsigned int uiUseZk_, const char * zkPath_)
 {
 	WSADATA wsaData;
@@ -63,6 +129,9 @@ uwb_network::Listener::Listener(const char * logPath_, unsigned int uiUseZk_, co
 	m_bConnectZk = false;
 	m_zk = NULL;
 	memset(m_szZkHome, 0, sizeof(m_szZkHome));
+	memset(m_szInstPath, 0, sizeof(m_szInstPath));
+	memset(m_szLocalIp, 0, sizeof(m_szLocalIp));
+	memset(&m_listenerData, 0, sizeof(m_listenerData));
 
 	m_ullLogInst = LOG_Init();
 	pf_logger::LogConfig logConf;
@@ -90,7 +159,6 @@ uwb_network::Listener::Listener(const char * logPath_, unsigned int uiUseZk_, co
 			m_bUseZk = true;
 		}
 	}
-
 }
 
 uwb_network::Listener::~Listener()
@@ -102,13 +170,19 @@ uwb_network::Listener::~Listener()
 		LOG_Release(m_ullLogInst);
 		m_ullLogInst = 0;
 	}
+	if (m_zk) {
+		zookeeper_close(m_zk);
+		m_zk = NULL;
+		m_bConnectZk = false;
+	}
 	zsys_shutdown();
 	WSACleanup();
 }
 
-int uwb_network::Listener::Start(unsigned short usListenPort_, unsigned short usPubPort_)
+int uwb_network::Listener::Start(unsigned short usListenPort_, unsigned short usPubPort_, const char * pLocalIp_)
 {
 	int result = -1;
+	char szLog[256] = { 0 };
 	if (!m_bRunning && usListenPort_ > 0) {
 		SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 		if (sock != INVALID_SOCKET) {
@@ -125,6 +199,9 @@ int uwb_network::Listener::Start(unsigned short usListenPort_, unsigned short us
 				m_listenSock = sock;
 				m_usListenPort = usListenPort_;
 				m_usPublishPort = usPubPort_;
+				if (pLocalIp_ && strlen(pLocalIp_)) {
+					strcpy_s(m_szLocalIp, sizeof(m_szLocalIp), pLocalIp_);
+				}
 				m_pub = zsock_new(ZMQ_PUB);
 				do {
 					if (zsock_bind(m_pub, "tcp://*:%hu", m_usPublishPort) != -1) {
@@ -137,10 +214,31 @@ int uwb_network::Listener::Start(unsigned short usListenPort_, unsigned short us
 				m_bRunning = true;
 				m_thdListenRecv = std::thread(uwb_network::listen_receive_thread, this);
 				m_thdHandleNetDataQue = std::thread(uwb_network::handle_netdata_queue_thread, this);
+				timeb t;
+				ftime(&t);
+				strcpy_s(m_listenerData.szIp, sizeof(m_listenerData.szIp), m_szLocalIp);
+				m_listenerData.usListenPort = m_usListenPort;
+				m_listenerData.usPubPort = m_usPublishPort;
+				m_listenerData.uStartTime = t.time * 1000 + t.millitm;
+				m_listenerData.uUpdateTime = m_listenerData.uStartTime;
+				sprintf_s(m_szInstPath, sizeof(m_szInstPath), "/uwb/netmodule/%s_%hu_%hu", m_szLocalIp, m_usListenPort,
+					m_usPublishPort);
+				if (m_bUseZk) {
+					zk_addNode();
+					m_thdZkState = std::thread(uwb_network::update_zk_state_thread, this);
+				}
+
 				result = 0;
+				sprintf_s(szLog, sizeof(szLog), "[listener]%s[%u]start listen port=%hu, pub port=%hu, localIp=%s success\n",
+					__FUNCTION__, __LINE__, usListenPort_, usPubPort_, (pLocalIp_ != NULL) ? pLocalIp_ : "null");
+				LOG_Log(m_ullLogInst, szLog, pf_logger::eLOGCATEGORY_INFO, pf_logger::eLOGTYPE_FILE);
 			}
 			else {
 				closesocket(sock);
+				sprintf_s(szLog, sizeof(szLog), "[listener]%s[%u]start listen port=%hu, publish port=%hu, localIp=%s failed,"
+					" bind port error=%d\n", __FUNCTION__, __LINE__, usListenPort_, usPubPort_, 
+					(pLocalIp_ != NULL) ? pLocalIp_ : "null", WSAGetLastError());
+				LOG_Log(m_ullLogInst, szLog, pf_logger::eLOGCATEGORY_INFO, pf_logger::eLOGTYPE_FILE);
 			}
 		}
 	}
@@ -167,6 +265,14 @@ int uwb_network::Listener::Stop()
 		}
 
 		clear_lingeDataList();
+
+		if (m_bUseZk) {
+			m_thdZkState.join();
+			zk_removeNode();
+			memset(m_szInstPath, 0, sizeof(m_szInstPath));
+			memset(&m_listenerData, 0, sizeof(m_listenerData));
+			m_bUseZk = false;
+		}
 	}
 	return 0;
 }
@@ -442,4 +548,32 @@ void uwb_network::Listener::publish(const char * pMsg_)
 	}
 }
 
+void uwb_network::Listener::zk_addNode()
+{
+	if (m_zk && m_bConnectZk) {
+		char szMsg[256] = { 0 };
+		sprintf_s(szMsg, sizeof(szMsg), "{\"ip\":\"%s\",\"lport\":%hu,\"pport\":%hu,\"starttime\":%llu,\"updatetime\":%llu}",
+			m_listenerData.szIp, m_listenerData.usListenPort, m_listenerData.usPubPort, m_listenerData.uStartTime, 
+			m_listenerData.uUpdateTime);
+		zoo_acreate(m_zk, m_szInstPath, szMsg, (int)strlen(szMsg), &ZOO_OPEN_ACL_UNSAFE, 0, 
+			uwb_network::zk_create_instance_completion, this);
+	}
+}
 
+void uwb_network::Listener::zk_updateNode()
+{
+	if (m_zk && m_bConnectZk) {
+		char szMsg[256] = { 0 };
+		sprintf_s(szMsg, sizeof(szMsg), "{\"ip\":\"%s\",\"lport\":%hu,\"pport\":%hu,\"starttime\":%llu,\"updatetime\":%llu}",
+			m_listenerData.szIp, m_listenerData.usListenPort, m_listenerData.usPubPort, m_listenerData.uStartTime,
+			m_listenerData.uUpdateTime);
+		zoo_aset(m_zk, m_szInstPath, szMsg, (int)strlen(szMsg), -1, uwb_network::zk_set_node_stat_completion, this);
+	}
+}
+
+void uwb_network::Listener::zk_removeNode()
+{
+	if (m_zk && m_bConnectZk) {
+		zoo_delete(m_zk, m_szInstPath, -1);
+	}
+}

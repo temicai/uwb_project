@@ -70,16 +70,26 @@ namespace uwb_network
 		unsigned char * pLingeData;
 	} LingeData;
 
+	typedef struct tagListenData
+	{
+		char szIp[32];
+		unsigned short usListenPort;
+		unsigned short usPubPort;
+		uint64_t uStartTime;
+		uint64_t uUpdateTime;
+	} ListenerData;
+
 	class Listener
 	{
 	public:
 		explicit Listener(const char * logPath = NULL, unsigned int useZk = 0, const char * zkPath = NULL);
 		~Listener();
-		int Start(unsigned short usPort, unsigned short);
+		int Start(unsigned short, unsigned short, const char * szIp = NULL);
 		int Stop();
 	private:
 		unsigned short m_usListenPort;
 		unsigned short m_usPublishPort;
+		char m_szLocalIp[32];
 		bool m_bRunning;
 		unsigned long long m_ullLogInst;
 		
@@ -87,6 +97,9 @@ namespace uwb_network
 		bool m_bUseZk;
 		zhandle_t * m_zk;
 		char m_szZkHome[256];
+		char m_szInstPath[256];
+		ListenerData m_listenerData;
+		std::thread m_thdZkState;
 
 		SOCKET m_listenSock;
 		std::thread m_thdListenRecv;
@@ -97,7 +110,7 @@ namespace uwb_network
 		std::mutex m_mutex4NetDataQue;
 		std::condition_variable m_cond4NetDataQue;
 		std::thread m_thdHandleNetDataQue;
-
+		
 		typedef std::map<std::string, LingeData *> LingeDataList;
 		LingeDataList m_netLingeDataList;
 		std::mutex m_mutex4LingeDataList;
@@ -110,10 +123,18 @@ namespace uwb_network
 		bool add_lingeData(LingeData *);
 		void clear_lingeDataList();
 		void publish(const char *);
+		void zk_addNode();
+		void zk_updateNode();
+		void zk_removeNode();
+		
 		friend void listen_receive_thread(void *);
 		friend void handle_netdata_queue_thread(void *);
+		friend void update_zk_state_thread(void *);
+
 		friend void zk_server_watcher(zhandle_t *, int, int, const char *, void *);
 		friend void zk_create_node_completion(int rc, const char *, const void *);
+		friend void zk_create_instance_completion(int rc, const char *value, const void *data);
+		friend void zk_set_node_stat_completion(int rc, const struct Stat *stat, const void *data);
 	};
 
 }
